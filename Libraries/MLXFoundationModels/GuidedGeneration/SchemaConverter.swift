@@ -21,11 +21,62 @@ enum SchemaConverter {
     /// to import the framework that owns the `JSONSchema` type.
     static func encodeToJSON(_ schema: GenerationSchema) throws -> String {
         let data = try JSONEncoder().encode(schema)
-        guard let jsonString = String(data: data, encoding: .utf8) else {
-            throw SchemaConversionError.encodingFailed
-        }
+        let jsonString = try orderedJSONString(JSONSerialization.jsonObject(with: data))
         logger.debug("Schema JSON (\(data.count) bytes)")
         return jsonString
+    }
+
+    /// Serializes a JSON object with each `properties` object in the order of its sibling
+    /// `x-order`, and every other object's keys sorted.
+    ///
+    /// xgrammar generates properties in the order they appear in the schema, but
+    /// `GenerationSchema` encodes `properties` as an unordered dictionary, so without this
+    /// the generation order (and so the output, even with greedy sampling) changes between
+    /// processes.
+    static func orderedJSONString(_ value: Any) throws -> String {
+        var output = ""
+        try writeOrderedJSON(value, propertyOrder: nil, to: &output)
+        return output
+    }
+
+    private static func writeOrderedJSON(
+        _ value: Any, propertyOrder: [String]?, to output: inout String
+    ) throws {
+        switch value {
+        case let object as [String: Any]:
+            let keys: [String]
+            if let propertyOrder {
+                let unordered = object.keys.filter { !propertyOrder.contains($0) }.sorted()
+                keys = propertyOrder.filter { object[$0] != nil } + unordered
+            } else {
+                keys = object.keys.sorted()
+            }
+            let childOrder = object["x-order"] as? [String]
+            output += "{"
+            for (index, key) in keys.enumerated() {
+                if index > 0 { output += "," }
+                try writeOrderedJSON(key, propertyOrder: nil, to: &output)
+                output += ":"
+                try writeOrderedJSON(
+                    object[key]!,
+                    propertyOrder: propertyOrder == nil && key == "properties" ? childOrder : nil,
+                    to: &output)
+            }
+            output += "}"
+        case let array as [Any]:
+            output += "["
+            for (index, element) in array.enumerated() {
+                if index > 0 { output += "," }
+                try writeOrderedJSON(element, propertyOrder: nil, to: &output)
+            }
+            output += "]"
+        default:
+            let data = try JSONSerialization.data(withJSONObject: value, options: [.fragmentsAllowed])
+            guard let fragment = String(data: data, encoding: .utf8) else {
+                throw SchemaConversionError.encodingFailed
+            }
+            output += fragment
+        }
     }
 
     /// Builds the JSON Schema describing the tool-calling envelope itself:
@@ -66,12 +117,9 @@ enum SchemaConverter {
         tools: [Transcript.ToolDefinition]
     ) throws -> String {
         let envelope = try toolCallingEnvelopeObject(tools: tools)
-        let data = try JSONSerialization.data(withJSONObject: envelope)
-        guard let jsonString = String(data: data, encoding: .utf8) else {
-            throw SchemaConversionError.encodingFailed
-        }
+        let jsonString = try orderedJSONString(envelope)
         logger.debug(
-            "Tool-calling envelope JSON (\(data.count) bytes, \(tools.count) tools)")
+            "Tool-calling envelope JSON (\(jsonString.utf8.count) bytes, \(tools.count) tools)")
         return jsonString
     }
 
@@ -187,12 +235,9 @@ enum SchemaConverter {
             ] as [String: Any],
         ]
 
-        let data = try JSONSerialization.data(withJSONObject: structuralTag)
-        guard let jsonString = String(data: data, encoding: .utf8) else {
-            throw SchemaConversionError.encodingFailed
-        }
+        let jsonString = try orderedJSONString(structuralTag)
         logger.debug(
-            "Tool-calling structural-tag JSON (\(data.count) bytes, \(tools.count) tools)"
+            "Tool-calling structural-tag JSON (\(jsonString.utf8.count) bytes, \(tools.count) tools)"
         )
         return jsonString
     }
